@@ -257,7 +257,6 @@ use core::intrinsics::abort;
 use core::iter;
 use core::marker::{PhantomData, Unsize};
 #[cfg(not(no_global_oom_handling))]
-use core::mem::size_of_val;
 use core::mem::{self, align_of_val_raw, forget, ManuallyDrop};
 use core::ops::{CoerceUnsized, Deref, DerefMut, DispatchFromDyn, Receiver};
 use core::panic::{RefUnwindSafe, UnwindSafe};
@@ -1428,37 +1427,55 @@ impl<T: ?Sized> Rc<T> {
         Ok(inner)
     }
 
-    /// Allocates an `RcBox<T>` with sufficient space for an unsized inner value
-    #[cfg(not(no_global_oom_handling))]
-    unsafe fn allocate_for_ptr(ptr: *const T) -> *mut RcBox<T> {
-        // Allocate for the `RcBox<T>` using the given value.
+    #[inline]
+    unsafe fn try_reallocate_for_layout(
+        value_layout: Layout,
+        allocate: impl FnOnce(Layout) -> Result<NonNull<[u8]>, AllocError>,
+        mem_to_rcbox: impl FnOnce(*mut u8) -> *mut RcBox<T>,
+    ) -> Result<*mut RcBox<T>, AllocError> {
+        let layout = rcbox_layout_for_value_layout(value_layout);
+
+        // Allocate for the layout.
+        let ptr = allocate(layout)?;
+
+        // Initialize the RcBox
+        let inner = mem_to_rcbox(ptr.as_non_null_ptr().as_ptr());
+        let copy_base: *mut u8 = inner.cast();
+        let shift = Layout::new::<RcBox<()>>().size();
+
         unsafe {
-            Self::allocate_for_layout(
-                Layout::for_value(&*ptr),
-                |layout| Global.allocate(layout),
-                |mem| mem.with_metadata_of(ptr as *const RcBox<T>),
-            )
+            debug_assert_eq!(Layout::for_value(&*inner), layout);
+
+            ptr::copy(copy_base, copy_base.add(shift), value_layout.size());
+
+            ptr::write(&mut (*inner).strong, Cell::new(1));
+            ptr::write(&mut (*inner).weak, Cell::new(1));
         }
+
+        Ok(inner)
     }
 
     #[cfg(not(no_global_oom_handling))]
     fn from_box(src: Box<T>) -> Rc<T> {
+        // Ddystopia: Box
+        let old_layout = Layout::for_value(&*src);
+
+        let ptr = NonNull::from(&*src).cast::<u8>();
+        let box_ptr = Box::into_raw(src);
+        let meta = ptr::metadata(box_ptr as *mut RcBox<T>);
+
         unsafe {
-            let value_size = size_of_val(&*src);
-            let ptr = Self::allocate_for_ptr(&*src);
-
-            // Copy value as bytes
-            ptr::copy_nonoverlapping(
-                &*src as *const T as *const u8,
-                &mut (*ptr).value as *mut _ as *mut u8,
-                value_size,
-            );
-
-            // Free the allocation without dropping its contents
-            let src = Box::from_raw(Box::into_raw(src) as *mut mem::ManuallyDrop<T>);
-            drop(src);
-
-            Self::from_ptr(ptr)
+            let rc = Self::try_reallocate_for_layout(
+                old_layout,
+                |new_layout| Global.grow(ptr, old_layout, new_layout),
+                |mem| ptr::from_raw_parts_mut(mem.cast(), meta),
+            )
+            .unwrap_or_else(|_| {
+                let new_layout = rcbox_layout_for_value_layout(old_layout);
+                drop(Box::from_raw(box_ptr));
+                handle_alloc_error(new_layout)
+            });
+            Self::from_ptr(rc)
         }
     }
 }
@@ -1976,7 +1993,9 @@ impl From<String> for Rc<str> {
     /// ```
     #[inline]
     fn from(v: String) -> Rc<str> {
-        Rc::from(&v[..])
+        let bytes: Rc<[u8]> = Rc::from(v.into_bytes());
+        unsafe { Rc::from_raw(Rc::into_raw(bytes) as *const str) }
+        // Rc::from(&v[..])
     }
 }
 
@@ -2002,23 +2021,42 @@ impl<T: ?Sized> From<Box<T>> for Rc<T> {
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "shared_from_slice", since = "1.21.0")]
 impl<T> From<Vec<T>> for Rc<[T]> {
-    /// Allocate a reference-counted slice and move `v`'s items into it.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use std::rc::Rc;
-    /// let original: Box<Vec<i32>> = Box::new(vec![1, 2, 3]);
-    /// let shared: Rc<Vec<i32>> = Rc::from(original);
-    /// assert_eq!(vec![1, 2, 3], *shared);
-    /// ```
+    // #[inline]
+    // fn from(mut v: Vec<T>) -> Rc<[T]> {
+    //     unsafe {
+    //         let rc = Rc::copy_from_slice(&v);
+    //         // Allow the Vec to free its memory, but not destroy its contents
+    //         v.set_len(0);
+    //         rc
+    //     }
+    // }
+    // Ddystopia: Vec
     #[inline]
-    fn from(mut v: Vec<T>) -> Rc<[T]> {
+    fn from(v: Vec<T>) -> Rc<[T]> {
+        let ptr = NonNull::from(&*v).cast::<u8>();
+        let (vec_ptr, len, cap) = Vec::into_raw_parts(v);
+
+        let old_layout = unsafe { Layout::array::<T>(cap).unwrap_unchecked() };
+        let new_layout = unsafe { Layout::array::<T>(len).unwrap_unchecked() };
+
         unsafe {
-            let rc = Rc::copy_from_slice(&v);
-            // Allow the Vec to free its memory, but not destroy its contents
-            v.set_len(0);
-            rc
+            let rc = Self::try_reallocate_for_layout(
+                new_layout,
+                |new_layout| {
+                    if old_layout.size() <= new_layout.size() {
+                        Global.grow(ptr, old_layout, new_layout)
+                    } else {
+                        Global.shrink(ptr, old_layout, new_layout)
+                    }
+                },
+                |mem| ptr::from_raw_parts_mut(mem.cast(), len),
+            )
+            .unwrap_or_else(|_| {
+                let final_layout = rcbox_layout_for_value_layout(new_layout);
+                drop(Vec::from_raw_parts(vec_ptr, len, cap));
+                handle_alloc_error(final_layout)
+            });
+            Self::from_ptr(rc)
         }
     }
 }
